@@ -413,18 +413,30 @@ struct ShapSplitCondition {
   ShapSplitCondition() = default;
   XGBOOST_DEVICE
   ShapSplitCondition(float feature_lower_bound, float feature_upper_bound,
-                     bool is_missing_branch, common::CatBitField cats)
+                     bool is_missing_branch, const common::CatBitField* cats)
       : feature_lower_bound(feature_lower_bound),
         feature_upper_bound(feature_upper_bound),
-        is_missing_branch(is_missing_branch), categories{std::move(cats)} {
+        is_missing_branch(is_missing_branch)} {
     assert(feature_lower_bound <= feature_upper_bound);
+    if (cats!=nullptr && cats->Capacity() > 0) {
+      // create a copy of cats only if we need it
+      p_categories = new common::CatBitField(*cats);
+      is_p_categories_initialized = true;
+    }
   }
+  // XGBOOST_DEVICE
+  // ~ShapSplitCondition() {
+  //   if (is_p_categories_initialized) {
+  //     delete p_categories;
+  //   }
+  // }
 
   /*! Feature values >= lower and < upper flow down this path. */
   float feature_lower_bound;
   float feature_upper_bound;
   /*! Feature value set to true flow down this path. */
-  common::CatBitField categories;
+  common::CatBitField* p_categories{nullptr};
+  bool is_p_categories_initialized{false};
   /*! Do missing values flow down this path? */
   bool is_missing_branch;
 
@@ -434,9 +446,9 @@ struct ShapSplitCondition {
     if (isnan(x)) {
       return is_missing_branch;
     }
-    if (categories.Capacity() != 0) {
+    if (is_p_categories_initialized) {
       auto cat = static_cast<uint32_t>(x);
-      return categories.Check(cat);
+      return p_categories->Check(cat);
     } else {
       return x >= feature_lower_bound && x < feature_upper_bound;
     }
@@ -444,25 +456,31 @@ struct ShapSplitCondition {
 
   // the &= op in bitfiled is per cuda thread, this one loops over the entire
   // bitfield.
-  XGBOOST_DEVICE static common::CatBitField Intersect(common::CatBitField l,
-                                                      common::CatBitField r) {
-    if (l.Data() == r.Data()) {
+  XGBOOST_DEVICE static common::CatBitField* Intersect(common::CatBitField* l,
+                                                      common::CatBitField* r) {
+    if (l->Data() == r->Data()) {
       return l;
     }
-    if (l.Capacity() > r.Capacity()) {
-      thrust::swap(l, r);
+    l = new common::CatBitField(*l);
+    r = new common::CatBitField(*r);
+    if (l->Capacity() > r->Capacity()) {
+      common::CatBitField* tmp = l;
+      l = r;
+      r = tmp;
     }
-    for (size_t i = 0; i < r.Bits().size(); ++i) {
-      l.Bits()[i] &= r.Bits()[i];
+    for (size_t i = 0; i < r->Bits().size(); ++i) {
+      l->Bits()[i] &= r->Bits()[i];
     }
+    delete r;
     return l;
   }
 
   // Combine two split conditions on the same feature
-  XGBOOST_DEVICE void Merge(ShapSplitCondition other) {
+  XGBOOST_DEVICE void Merge(ShapSplitCondition& other) {
     // Combine duplicate features
-    if (categories.Capacity() != 0 || other.categories.Capacity() != 0) {
-      categories = Intersect(categories, other.categories);
+    if ((is_p_categories_initialized  && other.is_p_categories_initialized) &&
+     (p_categories->Capacity()>0 || other.p_categories->Capacity()>0)) {
+      p_categories = Intersect(p_categories, other.p_categories);
     } else {
       feature_lower_bound = max(feature_lower_bound, other.feature_lower_bound);
       feature_upper_bound = min(feature_upper_bound, other.feature_upper_bound);
@@ -573,8 +591,8 @@ void ExtractPaths(Context const* ctx,
 
       float lower_bound = -inf;
       float upper_bound = inf;
-      common::CatBitField bits;
-      if (common::IsCat(tree.cats.split_type, child.Parent())) {
+      common::CatBitField* bits = nullptr;
+      if (tree.HasCategoricalSplit() && common::IsCat(tree.cats.split_type, child.Parent())) {
         auto path_cats = d_path_categories.subspan(max_cat * output_position, max_cat);
         size_t size = tree.cats.node_ptr[child.Parent()].size;
         auto node_cats = tree.cats.categories.subspan(tree.cats.node_ptr[child.Parent()].beg, size);
@@ -582,7 +600,7 @@ void ExtractPaths(Context const* ctx,
         for (size_t i = 0; i < node_cats.size(); ++i) {
           path_cats[i] = is_left_path ? ~node_cats[i] : node_cats[i];
         }
-        bits = common::CatBitField{path_cats};
+        bits = new common::CatBitField{path_cats};
       } else {
         lower_bound = is_left_path ? -inf : parent.SplitCond();
         upper_bound = is_left_path ? parent.SplitCond() : inf;
@@ -594,9 +612,12 @@ void ExtractPaths(Context const* ctx,
               zero_fraction, v};
       child_idx = parent_idx;
       child = parent;
+      if (bits != nullptr) {
+        delete bits;
+      }
     }
     // Root node has feature -1
-    d_paths[output_position] = {idx, -1, group, ShapSplitCondition{-inf, inf, false, {}}, 1.0, v};
+    d_paths[output_position] = {idx, -1, group, ShapSplitCondition{-inf, inf, false, nullptr}, 1.0, v};
   });
 }
 
